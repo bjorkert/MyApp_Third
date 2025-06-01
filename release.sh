@@ -23,6 +23,7 @@ echo_run()  { echo "+ $*"; "$@"; }
 push_cmds=()
 queue_push() { push_cmds+=("git -C \"$(pwd)\" $*"); echo "+ [queued] (in $(pwd)) git $*"; }
 
+# If an inappropriate tag exists - this requires manual intervention
 queue_delete_remote_tag () {
   local tag="$1"
   # shellcheck disable=SC2086
@@ -46,8 +47,9 @@ delete_local_tag_if_exists () {
 PRIMARY_ABS_PATH="$(pwd -P)"
 echo "🏁  Working in $PRIMARY_ABS_PATH …"
 
-echo_run git checkout "$DEV_BRANCH"
-echo_run git fetch --all
+# --- start out in main to capture old_ver ---- 
+echo_run git switch "$MAIN_BRANCH"
+echo_run git fetch
 echo_run git pull
 
 # -------- version bump logic (unchanged) -----------
@@ -70,10 +72,18 @@ esac
 echo "🔢  Bumping version: $old_ver  →  $new_ver"
 
 old_tag="v${old_ver}"
+# Script should never be run without old tag already set
 if ! git rev-parse "$old_tag" >/dev/null 2>&1; then
-  git tag -a "$old_tag" -m "$old_tag"
-  queue_push push --tags
+  echo "❌  The expected tag, {$old_tag}, does not exist"; exit 1 ;
 fi
+
+# --- switch to dev branch to release accumulated PR ----
+#     dev branch is old_ver.n where n is the number 
+#     of PR merged since last release
+
+echo_run git switch "$DEV_BRANCH"
+echo_run git fetch
+echo_run git pull
 
 sed -i '' "s/${MARKETING_KEY}[[:space:]]*=.*/${MARKETING_KEY} = ${new_ver}/" "$VERSION_FILE"
 echo_run git diff "$VERSION_FILE"; pause
@@ -81,13 +91,10 @@ echo_run git commit -m "update version to ${new_ver}" "$VERSION_FILE"
 
 echo "💻  Build & test dev branch now."; pause
 queue_push push origin "$DEV_BRANCH"
-git tag -d "v${new_ver}" 2>/dev/null || true
 git tag -a "v${new_ver}" -m "v${new_ver}"
-queue_delete_remote_tag "v${new_ver}"
 queue_push_tag "v${new_ver}"
 
-echo_run git checkout "$MAIN_BRANCH"
-echo_run git pull
+echo_run git switch "$MAIN_BRANCH"
 echo_run git merge "$DEV_BRANCH"
 echo "💻  Build & test main branch now."; pause
 queue_push push origin "$MAIN_BRANCH"
@@ -107,12 +114,12 @@ update_follower () {
   cd "$DIR"
 
   # 1 · Make sure we’re on a clean, up-to-date main
-  echo_run git checkout main
-  echo_run git fetch --all
+  echo_run git switch "$MAIN_BRANCH"
+  echo_run git fetch
   echo_run git pull
 
   # 2 · Apply the patch with 3-way fallback
-  if ! git apply --3way "$PATCH_FILE"; then
+  if ! git apply --3way  --whitespace=nowarn "$PATCH_FILE"; then
     echo "‼️  Some hunks could not be merged automatically."
   fi
 
@@ -129,7 +136,7 @@ update_follower () {
 
   echo_run git status
   pause                                     # build & test checkpoint
-  queue_push push origin main
+  queue_push push origin "$MAIN_BRANCH"
   cd ..
 }
 
