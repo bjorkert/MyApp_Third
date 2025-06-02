@@ -17,30 +17,50 @@ MAIN_BRANCH="main"
 PATCH_DIR="../${APP_NAME}_update_patches"
 # ---------------------------------------
 
+# --- functions here ---
 pause()     { read -rp "▶▶  Press Enter to continue (Ctrl-C to abort)…"; }
 echo_run()  { echo "+ $*"; "$@"; }
 
 push_cmds=()
 queue_push() { push_cmds+=("git -C \"$(pwd)\" $*"); echo "+ [queued] (in $(pwd)) git $*"; }
 
-# If an inappropriate tag exists - this requires manual intervention
-queue_delete_remote_tag () {
-  local tag="$1"
-  # shellcheck disable=SC2086
-  queue_push push --delete origin $tag
-}
-
 queue_push_tag () {
   local tag="$1"
   queue_push push origin "refs/tags/$tag"
 }
 
-delete_local_tag_if_exists () {
-  local tag="$1"
-  if git rev-parse -q "$tag" >/dev/null 2>&1; then
-    echo "+ git tag -d $tag   # remove stale local tag"
-    git tag -d "$tag"
+update_follower () {
+  local DIR="$1"
+  echo; echo "🔄  Updating $DIR …"
+  cd "$DIR"
+
+  # 1 · Make sure we’re on a clean, up-to-date main
+  echo_run git switch "$MAIN_BRANCH"
+  echo_run git fetch
+  echo_run git pull
+
+  # 2 · Apply the patch with 3-way fallback
+  if ! git apply --3way  --whitespace=nowarn "$PATCH_FILE"; then
+    echo "‼️  Some hunks could not be merged automatically."
   fi
+
+  # 3 · Pause if any conflict markers remain
+  if git ls-files -u | grep -q .; then
+    echo "⚠️  Conflicts detected."
+    echo "    If Fastfile or build_LoopFollow.yml were modified, these are expected."
+    echo "    Open your merge tool, resolve, then press Enter."
+    pause
+  fi
+
+  # 4 · Single commit capturing all staged changes
+  git add -u
+  git add $(git ls-files --others --exclude-standard) 2>/dev/null || true
+  git commit -m "transfer v${new_ver} updates from LF to ${DIR}"
+
+  echo_run git status
+  pause                                     # build & test checkpoint
+  queue_push push origin "$MAIN_BRANCH"
+  cd ..
 }
 
 # ---------- PRIMARY REPO ----------
@@ -71,87 +91,62 @@ esac
 
 echo "🔢  Bumping version: $old_ver  →  $new_ver"
 
-old_tag="v${old_ver}"
-# Script should never be run without old tag already set
-if ! git rev-parse "$old_tag" >/dev/null 2>&1; then
-  echo "❌  The expected tag, {$old_tag}, does not exist"; exit 1 ;
-fi
-
-# --- switch to dev branch to release accumulated PR ----
-#     dev branch is old_ver.n where n is the number 
-#     of PR merged since last release
-
+# --- switch to dev branch ----
 echo_run git switch "$DEV_BRANCH"
 echo_run git fetch
 echo_run git pull
 
+# --- update version number ----
 sed -i '' "s/${MARKETING_KEY}[[:space:]]*=.*/${MARKETING_KEY} = ${new_ver}/" "$VERSION_FILE"
 echo_run git diff "$VERSION_FILE"; pause
 echo_run git commit -m "update version to ${new_ver}" "$VERSION_FILE"
 
 echo "💻  Build & test dev branch now."; pause
 queue_push push origin "$DEV_BRANCH"
-git tag -a "v${new_ver}" -m "v${new_ver}"
-queue_push_tag "v${new_ver}"
-
-echo_run git switch "$MAIN_BRANCH"
-echo_run git merge "$DEV_BRANCH"
-echo "💻  Build & test main branch now."; pause
-queue_push push origin "$MAIN_BRANCH"
 
 # --- create a patch  ---------------------------
 mkdir -p "$PATCH_DIR"
 PATCH_FILE="${PATCH_DIR}/LF_diff_${old_ver}_to_${new_ver}.patch"
 
-git diff -M --binary "v${old_ver}".."v${new_ver}" \
+git diff -M --binary "$MAIN_BRANCH" "$DEV_BRANCH"  \
   > "$PATCH_FILE"
 
+# --- merge dev into main for new release
+echo_run git switch "$MAIN_BRANCH"
+echo_run git merge "$DEV_BRANCH"
+echo "💻  Build & test main branch now."; pause
+queue_push push origin "$MAIN_BRANCH"
+
 cd ..
-
-update_follower () {
-  local DIR="$1"
-  echo; echo "🔄  Updating $DIR …"
-  cd "$DIR"
-
-  # 1 · Make sure we’re on a clean, up-to-date main
-  echo_run git switch "$MAIN_BRANCH"
-  echo_run git fetch
-  echo_run git pull
-
-  # 2 · Apply the patch with 3-way fallback
-  if ! git apply --3way  --whitespace=nowarn "$PATCH_FILE"; then
-    echo "‼️  Some hunks could not be merged automatically."
-  fi
-
-  # 3 · Pause if any conflict markers remain
-  if git ls-files -u | grep -q .; then
-    echo "⚠️  Conflicts detected.  Open your merge tool, resolve, then press Enter."
-    pause
-  fi
-
-  # 4 · Single commit capturing all staged changes
-  git add -u
-  git add $(git ls-files --others --exclude-standard) 2>/dev/null || true
-  git commit -m "transfer v${new_ver} updates from LF to ${DIR}"
-
-  echo_run git status
-  pause                                     # build & test checkpoint
-  queue_push push origin "$MAIN_BRANCH"
-  cd ..
-}
-
 update_follower "$SECOND_DIR"
 update_follower "$THIRD_DIR"
 
+# ---------- GitHub Actions Test ---------
+echo; echo "💻  Test GitHub Build Actions and then continue."; pause
+
+# --- return to primary path
+cd ${PRIMARY_ABS_PATH}
+
 # ---------- push queue ----------
-echo; echo "🚀  Ready to push queued changes upstream."
+echo; echo "🚀  Ready to tag and push changes upstream."
+echo_run git log --oneline -2
+
+read -rp "▶▶  Ready to tag? (y/N): " confirm
+if [[ $confirm =~ ^[Yy]$ ]]; then
+  git tag -a "v${new_ver}" -m "v${new_ver}"
+  queue_push_tag "v${new_ver}"
+  echo_run git log --oneline -2
+else
+  echo "🚫  tag skipped, can add later"
+fi
+
 read -rp "▶▶  Push everything now? (y/N): " confirm
 if [[ $confirm =~ ^[Yy]$ ]]; then
   for cmd in "${push_cmds[@]}"; do echo "+ $cmd"; bash -c "$cmd"; done
   echo "🎉  All pushes completed."
+  echo; echo "🎉  All repos updated to v${new_ver} (local)."
+  echo "👉  Remember to create a GitHub release for tag v${new_ver}."
 else
   echo "🚫  Pushes skipped.  Run manually if needed:"; printf '   %s\n' "${push_cmds[@]}"
+  echo "🚫  Release not completed, pushes to GitHub were skipped"
 fi
-
-echo; echo "🎉  All repos updated to v${new_ver} (local)."
-echo "👉  Remember to create a GitHub release for tag v${new_ver}."
